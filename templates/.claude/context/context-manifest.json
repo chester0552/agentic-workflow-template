@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Defines which context files each agent needs to load",
+  "agents": {
+    "developer": {
+      "required": [
+        "project-overview.md",
+        "design-system.md",
+        "requirements-summary.md"
+      ],
+      "optional": [],
+      "description": "Developer needs full context for implementation"
+    },
+    "reviewer": {
+      "required": [],
+      "optional": [
+        "design-system.md",
+        "requirements-summary.md",
+        "project-overview.md"
+      ],
+      "description": "Consolidated reviewer loads only context files needed for assigned dimensions (qa/security/pm)"
+    },
+    "qa-reviewer": {
+      "required": [
+        "design-system.md",
+        "requirements-summary.md"
+      ],
+      "optional": [],
+      "description": "QA review. Prefer consolidated reviewer agent for most tasks."
+    },
+    "security-ops": {
+      "required": [
+        "requirements-summary.md"
+      ],
+      "optional": [],
+      "description": "Security review. Prefer consolidated reviewer agent for most tasks."
+    },
+    "project-manager": {
+      "required": [
+        "project-overview.md",
+        "requirements-summary.md"
+      ],
+      "optional": [],
+      "description": "Requirements review. Prefer consolidated reviewer agent for most tasks."
+    },
+    "task-manager": {
+      "required": [],
+      "optional": [],
+      "description": "Task manager only needs task database access (on-demand only)"
+    },
+    "researcher": {
+      "required": [
+        "project-overview.md"
+      ],
+      "optional": [
+        "design-system.md",
+        "requirements-summary.md"
+      ],
+      "description": "Researcher needs project context for technical research"
+    }
+  },
+  "context_files": {
+    "project-overview.md": {
+      "size": "~2KB",
+      "purpose": "High-level project summary, tech stack, key requirements",
+      "update_frequency": "Rarely (major project changes only)"
+    },
+    "design-system.md": {
+      "size": "~4KB",
+      "purpose": "Design tokens, component patterns, styling conventions",
+      "update_frequency": "Occasionally (design system updates)"
+    },
+    "requirements-summary.md": {
+      "size": "~4KB",
+      "purpose": "Acceptance criteria, code standards, security, testing requirements",
+      "update_frequency": "Occasionally (requirement changes)"
+    }
+  },
+  "optimization_notes": {
+    "context_loading": "Agents should read only required context files from .claude/context/",
+    "full_spec_access": "Agents should ONLY read full spec documents if specific detail is needed",
+    "total_context_budget": "~10KB for all context files"
+  }
+}
