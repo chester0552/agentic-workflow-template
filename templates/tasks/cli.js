@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 const db = require('./db');
+const fs = require('fs');
+const path = require('path');
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -126,7 +128,9 @@ async function main() {
           tests: flags.tests,
           blocked_by: flags['blocked-by'],
           model: flags.model || 'sonnet',
-          reviews: flags.reviews
+          reviews: flags.reviews,
+          parent_task_id: flags['parent-task'] ? parseInt(flags['parent-task']) : undefined,
+          iteration: flags.iteration ? parseInt(flags.iteration) : undefined,
         });
         console.log(`✅ Task #${id} created: ${flags.title} [model: ${flags.model || 'sonnet'}]`);
         break;
@@ -157,10 +161,23 @@ async function main() {
       case 'claim': {
         const id = parseInt(args[1]);
         const flags = parseFlags(args.slice(2));
-        if (!id) { console.error('Usage: claim <id> --agent <name> [--session <session-id>]'); process.exit(1); }
+        if (!id) { console.error('Usage: claim <id> --agent <n> [--session <session-id>]'); process.exit(1); }
+
+        const task = await db.getTask(id);
+        if (!task) { console.error('Task #' + id + ' not found'); process.exit(1); }
+
+        const model = task.model && task.model !== 'sonnet' ? task.model : db.inferModel(task);
+        const reviews = task.reviews || db.inferReviews(task);
+        const contextFiles = db.inferContextFiles(reviews);
+
+        await db.updateTask(id, { model, reviews });
         await db.claimTask(id, flags.agent || 'primary', flags.session);
-        const sessionNote = flags.session ? ` (session: ${flags.session})` : '';
-        console.log(`✅ Task #${id} claimed by ${flags.agent || 'primary'}${sessionNote}`);
+        const sessionNote = flags.session ? ' (session: ' + flags.session + ')' : '';
+
+        console.log('✅ Task #' + id + ' claimed by ' + (flags.agent || 'primary') + sessionNote);
+        console.log('   Model: ' + model);
+        console.log('   Reviews: ' + reviews);
+        console.log('   Context: ' + contextFiles.join(', '));
         break;
       }
 
@@ -176,8 +193,11 @@ async function main() {
         const id = parseInt(args[1]);
         const flags = parseFlags(args.slice(2));
         if (!id) { console.error('Usage: complete <id> --summary "..."'); process.exit(1); }
-        await db.completeTask(id, flags.summary || 'Completed', flags.agent);
-        console.log(`✅ Task #${id} completed`);
+        const result = await db.completeTask(id, flags.summary || 'Completed', flags.agent);
+        console.log('✅ Task #' + id + ' completed');
+        if (result.unblocked && result.unblocked.length > 0) {
+          console.log('🔓 Auto-unblocked: ' + result.unblocked.map(t => 'Task #' + t).join(', '));
+        }
         break;
       }
 
@@ -444,6 +464,123 @@ async function main() {
         break;
       }
 
+      // ═══ ARTIFACTS ═══
+
+      case 'artifact': {
+        const subCmd = args[1];
+
+        if (subCmd === 'save') {
+          const taskId = parseInt(args[2]);
+          const flags = parseFlags(args.slice(3));
+          if (!taskId || !flags.type || !flags.content) {
+            console.error('Usage: artifact save <task-id> --type <dev_report|review_report|fix_dev|fix_review> --content "..." [--agent name] [--iteration N]');
+            process.exit(1);
+          }
+          await db.saveArtifact(taskId, flags.type, flags.content, flags.agent, parseInt(flags.iteration) || 1);
+          console.log('✅ Artifact saved: task #' + taskId + ' [' + flags.type + ']');
+          break;
+        }
+
+        if (subCmd === 'get') {
+          const taskId = parseInt(args[2]);
+          const flags = parseFlags(args.slice(3));
+          if (!taskId || !flags.type) {
+            console.error('Usage: artifact get <task-id> --type <type> [--iteration N]');
+            process.exit(1);
+          }
+          const artifact = await db.getArtifact(taskId, flags.type, flags.iteration);
+          if (!artifact) { console.log('No artifact found.'); break; }
+          console.log(artifact.content);
+          break;
+        }
+
+        if (subCmd === 'list') {
+          const taskId = parseInt(args[2]);
+          if (!taskId) { console.error('Usage: artifact list <task-id>'); process.exit(1); }
+          const artifacts = await db.listArtifacts(taskId);
+          if (!artifacts.length) { console.log('No artifacts for this task.'); break; }
+          console.log('\n📎 Artifacts for Task #' + taskId + ':\n');
+          for (const a of artifacts) {
+            const size = a.size_chars >= 1024 ? (a.size_chars / 1024).toFixed(1) + ' KB' : a.size_chars + ' chars';
+            console.log('  [' + a.iteration + '] ' + a.artifact_type + ' (' + size + ') — ' + (a.agent || 'unknown') + ' @ ' + a.created_at);
+          }
+          console.log('');
+          break;
+        }
+
+        console.error('Usage: artifact <save|get|list> ...');
+        break;
+      }
+
+      // ═══ CONTEXT DIGEST ═══
+
+      case 'context-digest': {
+        const contextDir = path.join(process.cwd(), '.claude', 'context');
+        const digestPath = path.join(contextDir, 'DIGEST.md');
+        const files = ['project-overview.md', 'design-system.md', 'requirements-summary.md'];
+        let digest = '# Project Digest (auto-generated)\n\n';
+        for (const file of files) {
+          const filePath = path.join(contextDir, file);
+          if (fs.existsSync(filePath)) {
+            const content = fs.readFileSync(filePath, 'utf8');
+            const cleaned = content
+              .replace(/<!--[\s\S]*?-->/g, '')
+              .replace(/^#+\s*$/gm, '')
+              .replace(/\n{3,}/g, '\n\n')
+              .trim();
+            if (cleaned.length > 50) {
+              digest += '## From ' + file + '\n' + cleaned + '\n\n';
+            }
+          }
+        }
+        fs.writeFileSync(digestPath, digest, 'utf8');
+        console.log('✅ Digest generated: ' + digestPath + ' (' + (Buffer.byteLength(digest) / 1024).toFixed(1) + ' KB)');
+        break;
+      }
+
+      // ═══ REVIEW FEEDBACK ═══
+
+      case 'review-feedback': {
+        const subCmd = args[1];
+
+        if (subCmd === 'log') {
+          const flags = parseFlags(args.slice(2));
+          if (!flags.task || !flags.dimension || !flags.item || !flags.result) {
+            console.error('Usage: review-feedback log --task <id> --dimension qa --item "unused imports" --result fail --useful 1');
+            process.exit(1);
+          }
+          const database = await db.getDb();
+          database.run(
+            'INSERT INTO review_feedback (task_id, dimension, checklist_item, result, was_useful) VALUES (?, ?, ?, ?, ?)',
+            [parseInt(flags.task), flags.dimension, flags.item, flags.result, parseInt(flags.useful) || 0]
+          );
+          db.saveDb(database);
+          console.log('✅ Feedback logged');
+          break;
+        }
+
+        if (subCmd === 'stats') {
+          const database = await db.getDb();
+          const result = database.exec(
+            "SELECT dimension, checklist_item, COUNT(*) as times_flagged, SUM(CASE WHEN was_useful = 1 THEN 1 ELSE 0 END) as times_useful, ROUND(100.0 * SUM(CASE WHEN was_useful = 1 THEN 1 ELSE 0 END) / COUNT(*), 0) as useful_pct FROM review_feedback WHERE result IN ('fail', 'warning') GROUP BY dimension, checklist_item ORDER BY useful_pct ASC, times_flagged DESC"
+          );
+          if (!result.length || !result[0].values.length) {
+            console.log('No review feedback recorded yet.');
+            break;
+          }
+          console.log('\n📊 Review Effectiveness:\n');
+          for (const row of result[0].values) {
+            const indicator = row[4] >= 50 ? '✅ keep' : row[4] >= 25 ? '⚠️  review' : '❌ noisy';
+            console.log('  ' + row[0] + ' → "' + row[1] + '": flagged ' + row[2] + 'x, useful ' + row[3] + 'x (' + row[4] + '%) ' + indicator);
+          }
+          console.log('');
+          break;
+        }
+
+        console.error('Usage: review-feedback <log|stats>');
+        break;
+      }
+
       // ═══ HELP ═══
 
       case 'help':
@@ -488,6 +625,17 @@ async function main() {
 ║
 ║  Export:
 ║    export [--format json|md] [--file path]          Export tasks
+║
+║  Artifacts:
+║    artifact save <id> --type <type> --content "..."  Save artifact
+║    artifact get <id> --type <type>                  Retrieve artifact
+║    artifact list <id>                               List task artifacts
+║
+║  Utilities:
+║    context-digest                                   Regenerate DIGEST.md
+║    review-feedback log --task <id> --dimension qa   Log review feedback
+║        --item "..." --result fail --useful 1
+║    review-feedback stats                            Review effectiveness
 ║
 ║  help                                               Show this help
 ║

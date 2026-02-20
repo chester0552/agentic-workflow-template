@@ -44,6 +44,8 @@ function initializeSchema(database) {
       completion_summary TEXT,
       model TEXT DEFAULT 'sonnet',
       reviews TEXT,
+      parent_task_id INTEGER,
+      iteration INTEGER DEFAULT 1,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     )
@@ -78,6 +80,35 @@ function initializeSchema(database) {
     )
   `);
 
+  database.run(`
+    CREATE TABLE IF NOT EXISTS task_artifacts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL,
+      artifact_type TEXT NOT NULL,
+      agent TEXT,
+      content TEXT,
+      iteration INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (task_id) REFERENCES tasks(id)
+    )
+  `);
+
+  database.run(`
+    CREATE INDEX IF NOT EXISTS idx_artifacts_task ON task_artifacts(task_id, artifact_type)
+  `);
+
+  database.run(`
+    CREATE TABLE IF NOT EXISTS review_feedback (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER,
+      dimension TEXT,
+      checklist_item TEXT,
+      result TEXT,
+      was_useful INTEGER,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
   saveDb(database);
 }
 
@@ -90,12 +121,12 @@ function saveDb(database) {
 }
 
 // Task CRUD Operations
-async function addTask({ title, priority = 'MEDIUM', group_name, category, description, files_affected, tests, blocked_by, model = 'sonnet', reviews }) {
+async function addTask({ title, priority = 'MEDIUM', group_name, category, description, files_affected, tests, blocked_by, model = 'sonnet', reviews, parent_task_id, iteration }) {
   const database = await getDb();
   database.run(
-    `INSERT INTO tasks (title, priority, group_name, category, description, files_affected, tests, blocked_by, model, reviews)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [title, priority, group_name || null, category || null, description || null, files_affected || null, tests || null, blocked_by || null, model, reviews || null]
+    `INSERT INTO tasks (title, priority, group_name, category, description, files_affected, tests, blocked_by, model, reviews, parent_task_id, iteration)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [title, priority, group_name || null, category || null, description || null, files_affected || null, tests || null, blocked_by || null, model, reviews || null, parent_task_id || null, iteration || null]
   );
   saveDb(database);
   const result = database.exec('SELECT last_insert_rowid() as id');
@@ -217,8 +248,7 @@ async function releaseTask(id) {
 
 async function completeTask(id, summary, agent) {
   const task = await getTask(id);
-  if (!task) throw new Error(`Task ${id} not found`);
-
+  if (!task) throw new Error('Task ' + id + ' not found');
   await updateTask(id, {
     status: 'completed',
     completed_at: new Date().toISOString(),
@@ -226,6 +256,8 @@ async function completeTask(id, summary, agent) {
     completion_summary: summary
   });
   await addHistory(id, 'complete', agent || task.claimed_by, task.status, 'completed');
+  const unblocked = await autoUnblockDependents(id);
+  return { unblocked };
 }
 
 async function blockTask(id, reason) {
@@ -583,6 +615,106 @@ async function exportTasks(format = 'json') {
   return md;
 }
 
+// ═══ AUTO-INFERENCE ═══
+
+const SECURITY_KEYWORDS = '{{SECURITY_KEYWORDS}}'.split(',').map(s => s.trim().toLowerCase());
+const UX_KEYWORDS = ['page', 'component', 'section', 'layout', 'design', 'content', 'navigation', 'ux'];
+
+function inferModel(task) {
+  const filesCount = (task.files_affected || '').split(',').filter(s => s.trim()).length;
+  const descLen = (task.description || '').length;
+  if (filesCount <= 1 && descLen < 100) return 'haiku';
+  if (/^(Fix:|Follow-up:)/i.test(task.title)) return 'haiku';
+  if (task.priority === 'CRITICAL' || filesCount >= 5) return 'opus';
+  return 'sonnet';
+}
+
+function inferReviews(task) {
+  const filesCount = (task.files_affected || '').split(',').filter(s => s.trim()).length;
+  const descLen = (task.description || '').length;
+  const text = ((task.title || '') + ' ' + (task.description || '')).toLowerCase();
+  if (filesCount <= 1 && descLen < 100) return 'none';
+  const dims = ['qa'];
+  if (SECURITY_KEYWORDS.some(kw => text.includes(kw))) dims.push('security');
+  const isFix = /^(Fix:|Follow-up:)/i.test(task.title) || text.includes('test');
+  const isUserFacing = UX_KEYWORDS.some(kw => text.includes(kw));
+  if (!isFix && isUserFacing) dims.push('pm');
+  return dims.join(',');
+}
+
+function inferContextFiles(reviews) {
+  if (reviews === 'none') return ['requirements-summary.md'];
+  if (reviews === 'qa') return ['requirements-summary.md', 'design-system.md'];
+  return ['project-overview.md', 'design-system.md', 'requirements-summary.md'];
+}
+
+// ═══ ARTIFACTS ═══
+
+const MAX_ARTIFACT_SIZE = 51200;
+
+async function saveArtifact(taskId, type, content, agent, iteration = 1) {
+  const database = await getDb();
+  if (content && content.length > MAX_ARTIFACT_SIZE) {
+    const originalSize = (content.length / 1024).toFixed(0);
+    content = content.substring(0, MAX_ARTIFACT_SIZE) + '\n\n[TRUNCATED — original was ' + originalSize + ' KB]';
+  }
+  database.run(
+    'INSERT INTO task_artifacts (task_id, artifact_type, agent, content, iteration) VALUES (?, ?, ?, ?, ?)',
+    [taskId, type, agent || null, content, iteration]
+  );
+  saveDb(database);
+}
+
+async function getArtifact(taskId, type, iteration) {
+  const database = await getDb();
+  const iterClause = iteration ? ' AND iteration = ' + parseInt(iteration) : '';
+  const result = database.exec(
+    'SELECT * FROM task_artifacts WHERE task_id = ? AND artifact_type = ?' + iterClause + ' ORDER BY created_at DESC LIMIT 1',
+    [taskId, type]
+  );
+  if (!result.length || !result[0].values.length) return null;
+  const columns = result[0].columns;
+  const values = result[0].values[0];
+  const artifact = {};
+  columns.forEach((col, i) => { artifact[col] = values[i]; });
+  return artifact;
+}
+
+async function listArtifacts(taskId) {
+  const database = await getDb();
+  const result = database.exec(
+    'SELECT id, task_id, artifact_type, agent, iteration, length(content) as size_chars, created_at FROM task_artifacts WHERE task_id = ? ORDER BY created_at',
+    [taskId]
+  );
+  if (!result.length) return [];
+  const columns = result[0].columns;
+  return result[0].values.map(row => {
+    const obj = {};
+    columns.forEach((col, i) => { obj[col] = row[i]; });
+    return obj;
+  });
+}
+
+// ═══ AUTO-UNBLOCK ═══
+
+async function autoUnblockDependents(completedTaskId) {
+  const allBlocked = await listTasks({ status: 'blocked' });
+  const unblocked = [];
+  for (const task of allBlocked) {
+    const deps = (task.blocked_by || '').split(',').map(s => parseInt(s.trim())).filter(Boolean);
+    if (!deps.includes(completedTaskId)) continue;
+    const remaining = deps.filter(d => d !== completedTaskId);
+    if (remaining.length === 0) {
+      await updateTask(task.id, { status: 'ready', blocked_by: null });
+      await addHistory(task.id, 'auto-unblock', null, 'blocked', 'ready');
+      unblocked.push(task.id);
+    } else {
+      await updateTask(task.id, { blocked_by: remaining.join(',') });
+    }
+  }
+  return unblocked;
+}
+
 // Close database
 async function close() {
   if (db) {
@@ -600,5 +732,8 @@ module.exports = {
   startSession, endSession, getActiveSessions, getTasksBySession, assignTaskToSession,
   getStats, getAgentStats, getStaleTasks, getNextTask,
   conflictCheck, suggestBatch, getDependencyTree, exportTasks,
+  inferModel, inferReviews, inferContextFiles,
+  saveArtifact, getArtifact, listArtifacts,
+  autoUnblockDependents,
   close
 };

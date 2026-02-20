@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 
+// Handle upgrade mode
+if (process.argv.includes('--upgrade')) {
+  require('./upgrade');
+  return;
+}
+
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
@@ -191,6 +197,35 @@ async function main() {
       } catch (error) {
         log('⚠ Database initialization failed, but continuing. Run "node tasks/cli.js list" manually.', 'yellow');
       }
+    }
+
+    // Run v4 migration
+    header('RUNNING V4 MIGRATION');
+    const migratePath = path.join(tasksDir, 'migrate-v4-artifacts.js');
+    if (fs.existsSync(migratePath)) {
+      try {
+        log('Adding artifact storage and iteration tracking...', 'cyan');
+        execSync('node tasks/migrate-v4-artifacts.js', { cwd: targetDir, stdio: 'pipe' });
+        log('✓ V4 migration complete', 'green');
+      } catch (error) {
+        log('⚠ V4 migration failed. Run manually: node tasks/migrate-v4-artifacts.js', 'yellow');
+      }
+    }
+
+    // Generate initial context digest
+    try {
+      log('Generating context digest...', 'cyan');
+      execSync('node tasks/cli.js context-digest', { cwd: targetDir, stdio: 'pipe' });
+      log('✓ Context digest generated', 'green');
+    } catch (error) {
+      log('⚠ Digest generation skipped (fill in context files first)', 'yellow');
+    }
+
+    // Create handoffs directory
+    const handoffsDir = path.join(targetDir, '.claude', 'handoffs');
+    if (!fs.existsSync(handoffsDir)) {
+      fs.mkdirSync(handoffsDir, { recursive: true });
+      log('✓ Created .claude/handoffs/ directory', 'green');
     }
 
     header('SETUP COMPLETE!');

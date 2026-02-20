@@ -5,212 +5,242 @@
 
 ---
 
-## Workflow Overview
+## Workflow: "Work on Task X"
 
-This project uses an agentic workflow system with specialized agents, automated task management, and a structured review pipeline.
-
-### User Interface
-
-**Simple Command:** When starting any work session, just say:
-```
-work on task 5
+### Step 1 — Get task details
+```bash
+node tasks/cli.js get <id>
 ```
 
-The orchestrator (Claude) will automatically:
-1. Get task details from DB
-2. Claim the task for the developer agent
-3. **Spawn** a developer subagent to implement the task
-4. **Spawn** reviewer subagent (consolidated - checks qa/security/pm based on task's reviews field)
-5. **Evaluate** review results directly (orchestrator handles decision + CLI)
-6. **Loop** if critical issues found (create fix tasks -> developer fix -> re-review -> re-evaluate)
-7. Report completion and suggest next task
-
-**The orchestrator never writes code** - all work is done by subagents spawned via the Task tool.
-
-### Core Workflow Loop
-
-```
-Single task:                          Multiple tasks (e.g., "work on 7 and 8"):
-
-1. Get + Claim                        1. Get + Claim ALL tasks (parallel Bash calls)
-2. Spawn developer                    2. Spawn N developers (ONE message, parallel Task calls)
-3. Spawn reviewer                     3. Spawn N reviewers (ONE message, parallel Task calls)
-4. Evaluate reviews (orchestrator)    4. Evaluate all reviews (orchestrator, no subagent)
-5. Handle decision                    5. Handle each decision independently
-   - FAIL -> loop                       - FAIL tasks loop, PASS tasks are done
+### Step 2 — Claim and read inference
+```bash
+node tasks/cli.js claim <id> --agent developer
 ```
 
-**Parallel execution rules:**
-- **Same step, one message** - Batch all subagent spawns for the same step into a single message
-- **Wait for ALL before advancing** - All Step 2 developers must return before spawning Step 3 reviewers
-- **Loop independently** - If task 7 passes but task 8 fails, report 7 done and loop only 8
-- **Label with task ID** - Every Task call description includes the task ID
+The CLI auto-infers and outputs model, reviews, and context files. Read the output:
+```
+✅ Task #5 claimed by developer
+   Model: sonnet
+   Reviews: qa,security
+   Context: requirements-summary.md, design-system.md
+```
+
+Use these values for all subagent spawning in subsequent steps. If the task already has explicit model/reviews in the DB, those override inference.
+
+### Step 2.5 — Pre-flight check
+
+Before spawning a developer, verify basics:
+```bash
+# Check listed files exist (if files_affected populated)
+for file in [files_affected split by comma]; do
+  [ -f "$file" ] || echo "⚠️ Missing: $file"
+done
+
+# Check test runner
+npx {{TESTING}} --version 2>/dev/null || echo "⚠️ Test runner not available"
+```
+
+If critical files are missing, notify the user before spawning. The orchestrator may resolve path issues (it can run bash) or ask the user.
+
+### Step 3 — Spawn developer subagent
+
+```
+Task(
+  description: "Developer - Task [id]: [title]",
+  subagent_type: "general-purpose",
+  model: [model from claim output],
+  prompt: "Read .claude/agents/developer.md and follow its instructions exactly.
+           Task ID: [id] | Title: [title]
+           Description: [full description]
+           Files Affected: [files_affected]
+           Context files to load: [from claim output]
+           Implement and return your structured report."
+)
+```
+
+**After developer returns**, save the report as an artifact:
+```bash
+node tasks/cli.js artifact save [id] --type dev_report --content "[developer's full structured response]" --agent developer
+```
+
+### Step 4 — Review (conditional)
+
+Check `reviews` value from the claim output.
+
+**If reviews = `none`:** Skip to Step 5.
+
+**Scoped fix review** (fix tasks from Step 6 loop):
+```
+Task(
+  description: "Reviewer - Task [id]: Verify fix",
+  subagent_type: "general-purpose",
+  model: [model from claim output],
+  prompt: "Read .claude/agents/reviewer.md.
+           REVIEW MODE: SCOPED FIX VERIFICATION
+           Task ID: [id]
+           ORIGINAL ISSUE: [the specific issue from failed review]
+           Retrieve dev report: node tasks/cli.js artifact get [id] --type dev_report
+           ONLY verify the specific issue was fixed. Return PASS or FAIL."
+)
+```
+
+**Standard review:**
+```
+Task(
+  description: "Reviewer - Task [id]: [title]",
+  subagent_type: "general-purpose",
+  model: [model from claim output],
+  prompt: "Read .claude/agents/reviewer.md.
+           Task ID: [id]
+           REVIEW DIMENSIONS: [reviews from claim output]
+           Retrieve dev report: node tasks/cli.js artifact get [id] --type dev_report
+           Return your Consolidated Review Report."
+)
+```
+
+**For CRITICAL priority tasks**, you MAY spawn 3 separate reviewers in parallel (qa-reviewer.md, security-ops.md, project-manager.md).
+
+**After reviewer returns**, save the report:
+```bash
+node tasks/cli.js artifact save [id] --type review_report --content "[reviewer's report]" --agent reviewer
+```
+
+### Step 5 — Evaluate and complete
+
+**If reviews was `none`:**
+```bash
+node tasks/cli.js complete <id> --summary "[brief summary from developer report]"
+```
+
+**If reviews were run**, apply the decision matrix:
+
+| Signal in Report | Classification |
+|-----------------|----------------|
+| "CRITICAL", "FAIL", "Must Fix" | **FAIL** |
+| "PASS WITH WARNINGS", "Should Fix" | **WARNINGS** |
+| "PASS", "SECURE", "MEETS REQUIREMENTS" | **PASS** |
+
+| Outcome | Action |
+|---------|--------|
+| Any FAIL | Create fix tasks: `node tasks/cli.js add --title "Fix: [issue]" --priority HIGH --description "[details]" --category Development --parent-task [id] --iteration [N]` |
+| All PASS | Complete: `node tasks/cli.js complete <id> --summary "[summary]"` |
+| PASS + WARNINGS | Complete + create follow-ups: `node tasks/cli.js add --title "Follow-up: [warning]" --priority LOW ...` |
+
+### Step 6 — Loop if needed
+
+| Outcome | Action |
+|---------|--------|
+| **FAIL** | Fix tasks created in Step 5. For EACH: claim → developer → scoped review → evaluate. |
+| **PASS** | Report completion. Run `node tasks/cli.js next` to suggest next task. |
+| **PASS_WITH_WARNINGS** | Report completion. Mention follow-ups. Suggest next task. |
+
+### Fix Loop Circuit Breaker (max 3 iterations)
+
+| Iteration | Action |
+|-----------|--------|
+| 1-2 | Normal: fix developer → scoped review → evaluate |
+| 3 | Final attempt. If review still FAILs: |
+| | → `node tasks/cli.js block [id] --reason "Failed review 3x: [summary]"` |
+| | → Report to user: "Task blocked after 3 fix attempts. Consider splitting or redefining." |
+| | → Do NOT create another fix task. |
+
+Before spawning a fix developer, check the task's iteration value. If iteration >= 3 AND review FAIL → block.
+
+---
+
+## Parallel Task Execution
+
+When user requests multiple tasks (e.g., "work on task 7 and 8"):
+
+```
+Step 1-2:  Get + Claim task 7  |  Get + Claim task 8        (parallel Bash calls)
+Step 3:    Developer - Task 7  |  Developer - Task 8        (parallel Task calls, ONE message)
+Step 4:    Reviewer - Task 7   |  Reviewer - Task 8         (parallel Task calls, ONE message)
+Step 5:    Evaluate both (orchestrator, no subagent needed)
+Step 6:    Handle independently: PASS tasks done, FAIL tasks loop
+```
+
+**Rules:**
+1. Same step across all tasks → single message with parallel tool calls
+2. Wait for ALL tasks to complete a step before advancing any
+3. Loop independently on failures
+4. Label with task ID: `"Developer - Task 7: Build hero section"`
+
+---
+
+## Error Recovery
+
+| Failure | Recovery |
+|---------|----------|
+| Subagent returns empty/garbage | Re-spawn once with same parameters. If second attempt fails, block task. |
+| Subagent timeout | Block task: "Subagent timeout — consider splitting task." |
+| Developer reports ISSUES ≠ "none" | Evaluate severity. Blocking → treat as FAIL. Informational → proceed to review. |
+| Reviewer report unparseable | Re-spawn once. If still unparseable → PASS_WITH_WARNINGS + follow-up: "Manual review needed." |
+| CLI command fails | Report error to user. Do not proceed to next step. |
 
 ---
 
 ## Subagent Roster
 
-All subagents are spawned via Task tool with `subagent_type: "general-purpose"`.
-Each reads its `.md` file from `.claude/agents/` for role and instructions.
+All use `subagent_type: "general-purpose"` and read their `.md` file.
 
-| Agent | File | Workflow Step | Role |
-|-------|------|---------------|------|
-| **developer** | `developer.md` | Step 3 | Writes code per project standards |
-| **reviewer** | `reviewer.md` | Step 4 (default) | Consolidated review: checks qa/security/pm in one pass |
-| **qa-reviewer** | `qa-reviewer.md` | Step 4 (CRITICAL only) | Separate QA review for maximum thoroughness |
-| **security-ops** | `security-ops.md` | Step 4 (CRITICAL only) | Separate security review |
-| **project-manager** | `project-manager.md` | Step 4 (CRITICAL only) | Separate requirements review |
-| **task-manager** | `task-manager.md` | On demand | Bulk task operations, reorganization, stats |
-| **researcher** | `researcher.md` | On demand | Technical research before complex tasks |
-
----
-
-## Auto-Inference Rules (Step 2)
-
-The orchestrator auto-infers `model`, `reviews`, and `context` at runtime. If the task has explicit values in the DB, use those. Otherwise:
-
-**Model (first match wins):**
-
-| Condition | Model |
-|-----------|-------|
-| 1 file + description < 100 chars | haiku |
-| Title: "Fix:..." or "Follow-up:..." | haiku |
-| Priority: CRITICAL or 5+ files affected | opus |
-| Everything else | sonnet |
-
-**Review dimensions (additive - each checked independently):**
-
-| Step | Action | Condition |
-|------|--------|-----------|
-| 0 | Set `none` (skip all) | 1 file affected AND description < 100 chars |
-| 1 | Base: `qa` | Always (unless Step 0 matched) |
-| 2 | Add `security` | Title/description mentions: {{SECURITY_KEYWORDS}} |
-| 3 | Add `pm` | New feature (not Fix:/Follow-up:/test) AND user-visible: page, component, section, layout, design, content, navigation, UX |
-
-**Context files (derived from reviews):**
-- `none` -> requirements-summary.md only
-- `qa` -> requirements-summary.md, design-system.md
-- Any with `security` or `pm` -> all 3
-
-**Persist to DB:** `node tasks/cli.js update <id> --model <inferred> --reviews <inferred>` - creates audit trail.
-
-**`reviews: none`** = skip Step 4 entirely.
-
-### Scoped Fix Reviews
-
-When looping on a fix task (FAIL -> developer fix -> re-review), the reviewer gets **scoped mode**:
-- Only verifies the specific issue from the original review was fixed
-- Does NOT re-review everything from scratch
-
-### Token Savings
-
-| Approach | Subagents | Context Loads | File Reads |
-|----------|-----------|---------------|------------|
-| 3 separate reviewers | 3 | 3 | 3x (same files) |
-| 1 consolidated reviewer | 1 | 1 | 1x |
-| 1 reviewer (qa only) | 1 | 1 (partial) | 1x |
+| Agent | File | When |
+|-------|------|------|
+| developer | `developer.md` | Step 3 |
+| reviewer | `reviewer.md` | Step 4 (default, consolidated) |
+| qa-reviewer | `qa-reviewer.md` | Step 4 (CRITICAL, 3-agent mode) |
+| security-ops | `security-ops.md` | Step 4 (CRITICAL, 3-agent mode) |
+| project-manager | `project-manager.md` | Step 4 (CRITICAL, 3-agent mode) |
+| task-manager | `task-manager.md` | On demand |
+| researcher | `researcher.md` | On demand |
+| decomposer | `decomposer.md` | On "decompose [goal]" |
 
 ---
 
-## Review Pipeline
+## Dry Run Mode
 
-### Decision Matrix (Executed by orchestrator directly)
+When user says **"dry run task X"**:
 
-**Classification:**
-- "CRITICAL", "FAIL", "Must Fix" -> **FAIL**
-- "PASS WITH WARNINGS", "Should Fix" -> **WARNINGS**
-- "PASS", "SECURE", "MEETS REQUIREMENTS" -> **PASS**
+1. Run Steps 1-2 (get, claim — reads inference output)
+2. Run pre-flight checks (Step 2.5)
+3. **STOP. Do not spawn subagents.**
 
-| Outcome | Orchestrator Action |
-|---------|---------------------|
-| **FAIL** | Create fix tasks via CLI. Loop: claim fix -> spawn developer -> spawn reviewer -> evaluate again. Repeat until PASS. |
-| **PASS** | Complete task via CLI. Report to user. Suggest next task. |
-| **PASS_WITH_WARNINGS** | Complete task via CLI + create follow-up tasks. Report to user. |
-
----
-
-## Task Lifecycle
-
+Report:
 ```
-ready -> in_progress -> [review] -> completed
-  |                       |
-  |                       v
-  |                    blocked -> ready (after fixes)
-  |
-  +-- blocked (external dependency)
+Dry Run — Task #[id]: [title]
+  Model: [from claim]
+  Reviews: [from claim]
+  Context: [from claim]
+  Files: [from task]
+  Pre-flight: [✅ or ⚠️]
+  Subagent calls: [N developer + N reviewer]
 ```
 
-### Task Fields
-- **id**: Auto-generated integer
-- **title**: Imperative description
-- **priority**: CRITICAL > HIGH > MEDIUM > LOW
-- **status**: ready | in_progress | blocked | completed
-- **group_name**: A (foundation), B (features), C (polish), D (launch)
-- **category**: Development, Testing, Design, Content, SEO, DevOps, Documentation
-- **model**: haiku | sonnet | opus (auto-inferred or manual)
-- **reviews**: qa | qa,security | qa,pm | qa,security,pm | none (auto-inferred or manual)
+Release claimed tasks after: `node tasks/cli.js release [id]`
 
 ---
 
-## Task Management Operations
+## Session Summary
 
-### Orchestrator CLI Operations (Steps 1-2, 5-6)
-- `node tasks/cli.js get <id>` - Read task details
-- `node tasks/cli.js claim <id> --agent developer` - Claim tasks
-- `node tasks/cli.js complete <id> --summary "..."` - Complete tasks
-- `node tasks/cli.js add --title "..." --priority ... --description "..."` - Create fix/follow-up tasks
-- `node tasks/cli.js next` - Suggest next task
+When user says **"done"**, **"wrap up"**, or all queued tasks complete:
 
----
+```markdown
+# Session Summary — [date]
 
-## Shared Context System
+## Completed
+- Task #[id]: [title] ([PASS|PASS_WITH_WARNINGS], [N] review cycles)
 
-All agents use pre-loaded context files from `.claude/context/`:
+## Blocked
+- Task #[id]: [title] (reason)
 
-| File | Purpose | Used By |
-|------|---------|---------|
-| `project-overview.md` | High-level requirements, tech stack | developer, project-manager, researcher |
-| `design-system.md` | Design tokens, component patterns | developer, qa-reviewer |
-| `requirements-summary.md` | Acceptance criteria, code standards | all agents |
+## Still In Progress
+- Task #[id]: [title] (status)
 
-### Context Optimization Rules
-1. Agents read context files first - only read full specs if specific detail needed
-2. Load only required context per dimension
-3. Total context budget: ~14KB for all context files
+## Auto-Unblocked This Session
+- Task #[id] (was blocked by #[id])
 
----
+## Next Session Suggestion
+- Task #[id] ([priority]) — [why this is next]
+```
 
-## Priority Guidelines
-
-| Priority | When to Use | Examples |
-|----------|-------------|---------|
-| CRITICAL | Blocks all other work | Build system broken, security vulnerability |
-| HIGH | Core feature, phase blocker | Key pages, integrations, core setup |
-| MEDIUM | Standard feature work | Secondary pages, enhancements |
-| LOW | Polish, nice-to-have | Micro-interactions, optimizations |
-
----
-
-## Group Guidelines
-
-| Group | Phase | Focus |
-|-------|-------|-------|
-| A | Foundation | Project setup, config, layout, navigation |
-| B | Core Features | Primary features, integrations |
-| C | Content/Polish | Real content, SEO, accessibility, performance |
-| D | Launch | Deploy, domain, testing, monitoring |
-
----
-
-## Important Rules
-
-1. **Orchestrator never codes** - spawns subagents for ALL work
-2. **Task-driven** - All work tracked in task database
-3. **Subagent-based execution** - ALL agent work uses Task tool with `subagent_type: "general-purpose"` + custom `.md` file
-4. **Review everything** - Never skip the review pipeline
-5. **Automated quality loop** - Orchestrator evaluates reviews directly, creates fix tasks and loops if FAIL
-6. **Use context files** - Subagents load `.claude/context/` files first
-7. **Performance** - Keep code efficient and well-structured
-8. **Accessibility** - Follow applicable accessibility standards
-9. **Don't over-engineer** - Simple and correct > complex and clever
-10. **Trust the loop** - Let the subagent pipeline run
+Save to: `.claude/handoffs/session-[YYYY-MM-DD].md`

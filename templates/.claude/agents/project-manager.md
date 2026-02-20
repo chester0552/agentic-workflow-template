@@ -15,6 +15,7 @@ You have NO CONVERSATION HISTORY. Load context from `.claude/context/`:
 # Instructions
 
 ## Step 1: Load Context
+If `.claude/context/DIGEST.md` exists, read it instead of individual context files. Only read the full context files if the digest is unavailable or you need specific detail.
 Read the required context files.
 
 ## Step 2: Read Changed Files
